@@ -1880,6 +1880,11 @@ fn the_clock_follows_the_language_until_a_format_is_chosen() {
 
 #[test]
 fn the_clock_follows_the_tv_region_before_the_language() {
+    let regions = crate::model::TWELVE_HOUR_REGIONS;
+    assert!(
+        regions.windows(2).all(|pair| pair[0] < pair[1]),
+        "sorted for binary_search"
+    );
     use crate::model::{Preferences, tv_hour_24};
     use serde_json::json;
     let locales =
@@ -1909,6 +1914,25 @@ fn the_clock_follows_the_tv_region_before_the_language() {
         None,
         "no region"
     );
+    assert_eq!(
+        tv_hour_24(&locales("en", "en-GB")),
+        Some(true),
+        "UI's region when FMT names none"
+    );
+    for region in ["MX", "CO", "CR", "KR", "TW", "EG"] {
+        assert_eq!(
+            tv_hour_24(&locales(&format!("es-{region}"), "de-DE")),
+            Some(false),
+            "{region} uses 12-hour"
+        );
+    }
+    for region in ["GB", "DE", "BR", "JP", "CN", "ZA"] {
+        assert_eq!(
+            tv_hour_24(&locales(&format!("en-{region}"), "en-US")),
+            Some(true),
+            "{region} uses 24-hour"
+        );
+    }
     assert_eq!(tv_hour_24(&json!({})), None);
 
     // An unset format takes the TV's; a chosen one is kept.

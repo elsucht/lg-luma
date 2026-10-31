@@ -308,11 +308,20 @@ pub fn demo_inventory() -> Inventory {
 }
 
 /// Regions whose clocks conventionally show 12 hours.
-const TWELVE_HOUR_REGIONS: [&str; 9] = ["US", "CA", "AU", "NZ", "IN", "PH", "PK", "EG", "SA"];
+/// Regions whose preferred hour cycle is 12-hour (`_preferred` `h`) in CLDR 49 `timeData`, sorted.
+pub(crate) const TWELVE_HOUR_REGIONS: [&str; 99] = [
+    "AE", "AG", "AL", "AS", "AU", "BB", "BD", "BH", "BM", "BN", "BO", "BS", "BT", "CA", "CO", "CR",
+    "CU", "CY", "DJ", "DM", "DO", "DZ", "EC", "EG", "EH", "ER", "ET", "FJ", "FM", "GD", "GH", "GM",
+    "GR", "GT", "GU", "GY", "HK", "HN", "IN", "IQ", "JM", "JO", "KH", "KI", "KN", "KP", "KR", "KW",
+    "KY", "LB", "LC", "LR", "LS", "LY", "MH", "MO", "MP", "MR", "MW", "MX", "MY", "NA", "NI", "NZ",
+    "OM", "PA", "PE", "PG", "PH", "PK", "PR", "PS", "PW", "QA", "SA", "SB", "SD", "SG", "SL", "SO",
+    "SS", "SV", "SY", "SZ", "TC", "TD", "TN", "TO", "TT", "TW", "UM", "US", "VC", "VE", "VG", "VI",
+    "VU", "WS", "YE",
+];
 
 /// The clock format in the TV's `localeInfo` setting: webOS's own 12/24 choice, else the
 /// region of the formatting locale (`FMT`, which can differ from the menu language), else
-/// of the menu locale. None when the TV names no region.
+/// of the menu locale, whichever first names a region. None when neither does.
 pub fn tv_hour_24(locale_info: &serde_json::Value) -> Option<bool> {
     match locale_info.get("clock").and_then(|clock| clock.as_str()) {
         Some("12") => return Some(false),
@@ -320,13 +329,14 @@ pub fn tv_hour_24(locale_info: &serde_json::Value) -> Option<bool> {
         _ => {}
     }
     let locales = locale_info.get("locales")?;
-    let locale = ["FMT", "UI"]
-        .iter()
-        .find_map(|key| locales.get(key).and_then(|locale| locale.as_str()))?;
     // "en-GB", "zh-Hans-CN": the region is the last subtag, two capital letters.
-    let region = locale
-        .rsplit(['-', '_'])
-        .next()
-        .filter(|region| region.len() == 2 && region.bytes().all(|b| b.is_ascii_uppercase()))?;
-    Some(!TWELVE_HOUR_REGIONS.contains(&region))
+    let region = ["FMT", "UI"].iter().find_map(|key| {
+        locales
+            .get(key)?
+            .as_str()?
+            .rsplit(['-', '_'])
+            .next()
+            .filter(|region| region.len() == 2 && region.bytes().all(|b| b.is_ascii_uppercase()))
+    })?;
+    Some(TWELVE_HOUR_REGIONS.binary_search(&region).is_err())
 }
