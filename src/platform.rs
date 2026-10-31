@@ -13,13 +13,51 @@ mod installation;
 
 pub const APP_ID: &str = "com.ecklf.luma";
 pub const HOME_ID: &str = "com.webos.app.home";
+pub const FULL_HOME_ID: &str = "com.webos.app.fullhome";
+
+pub fn is_home_id(id: &str) -> bool {
+    matches!(id, HOME_ID | FULL_HOME_ID)
+}
+
+/// Keep the window surface and SAM lifecycle identity aligned with the executed Home app.
+fn home_identity(executable: Option<&std::path::Path>, metadata: Option<&Value>) -> &'static str {
+    if let Some(executable) = executable {
+        if executable == std::path::Path::new("/usr/bin/com.webos.app.fullhome") {
+            return FULL_HOME_ID;
+        }
+        if executable == std::path::Path::new(LG_HOME_EXE) {
+            return HOME_ID;
+        }
+    }
+    if metadata.is_some_and(|value| {
+        ["nid", "appId"]
+            .iter()
+            .any(|key| value.get(key).and_then(Value::as_str) == Some(FULL_HOME_ID))
+    }) {
+        FULL_HOME_ID
+    } else {
+        HOME_ID
+    }
+}
+
+/// Derive the identity from SAM's actual launch, never from a saved preference.
+pub fn home_id() -> &'static str {
+    let executable = std::env::current_exe().ok();
+    let metadata = std::env::args()
+        .nth(1)
+        .and_then(|arg| serde_json::from_str::<Value>(&arg).ok());
+    home_identity(executable.as_deref(), metadata.as_ref())
+}
 /// LG's Home executable. A root integration may bind-mount Luma over it, so sam starts Luma
 /// under LG's own Home manifest and LS2 role (lifecycle v2, keep-alive, no sam restart).
 pub const LG_HOME_EXE: &str = "/usr/bin/com.webos.app.home";
 
 /// Whether this process runs in place of LG's Home executable.
 pub fn runs_as_lg_home() -> bool {
-    std::env::current_exe().is_ok_and(|exe| exe == std::path::Path::new(LG_HOME_EXE))
+    std::env::current_exe().is_ok_and(|exe| {
+        exe == std::path::Path::new(LG_HOME_EXE)
+            || exe == std::path::Path::new("/usr/bin/com.webos.app.fullhome")
+    })
 }
 
 /// While this file exists, a staged Home (webOS 10/11) does not register with sam and is
@@ -123,7 +161,8 @@ pub fn redirect_to_home() -> Result<bool, String> {
         thread::spawn(|| {
             call(
                 "luna://com.webos.applicationManager/launch",
-                json!({"id": HOME_ID}),
+                json!({"id": std::fs::read_to_string("/var/run/luma-home-target").ok()
+                    .filter(|id| is_home_id(id.trim())).map(|id| id.trim().to_owned()).unwrap_or_else(|| HOME_ID.into())}),
             )
         })
         .join()
@@ -136,6 +175,7 @@ pub fn redirect_to_home() -> Result<bool, String> {
 pub enum Request {
     Refresh,
     Clock,
+    RefreshInputs,
     Launch(String),
     Uninstall(String),
     SyncSplash(String),
@@ -147,6 +187,7 @@ pub enum Request {
 pub enum Response {
     Inventory(Result<(Inventory, Option<String>), String>),
     Clock(Option<bool>),
+    Inputs(Result<Vec<Input>, String>),
     Launched(Result<(), String>),
     Uninstalled {
         id: String,
@@ -215,17 +256,17 @@ impl Platform {
                         Ok((desktop_inventory.clone(), None))
                     }),
                     Request::Clock => Response::Clock(if webos { tv_clock() } else { None }),
+                    Request::RefreshInputs => Response::Inputs(if webos {
+                        input_inventory()
+                    } else {
+                        Ok(desktop_inventory.inputs.clone())
+                    }),
                     Request::Uninstall(id) => {
                         // Validate again at the worker boundary, not just in the UI.
                         let result = uninstall_request(&id).and_then(|(_, _)| {
                             if webos {
-                                let quote =
-                                    |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-                                let command = format!(
-                                    "/usr/bin/node -e {} {}",
-                                    quote(include_str!("../tv/uninstall-app.cjs")),
-                                    quote(&id)
-                                );
+                                let command =
+                                    helper_command("uninstall-app", std::slice::from_ref(&id))?;
                                 #[cfg(all(
                                     feature = "webos",
                                     target_os = "linux",
@@ -333,20 +374,118 @@ impl Platform {
     }
 
     pub fn sync_splash(&self, background: &str) {
-        if self.webos && self.splash_enabled {
+        if self.webos && self.splash_enabled && !crate::wallpapers::valid_id(background) {
             self.send(Request::SyncSplash(background.to_owned()));
         }
     }
 }
 
+/// Homebrew remains the privilege boundary for normal app jails. Each argument is shell-quoted
+/// independently; there is no interpreter source and no untrusted command name.
+fn helper_command(operation: &str, arguments: &[String]) -> Result<String, String> {
+    let executable = install_dir()?.join("luma-helper");
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let mut parts = vec![quote(&executable.to_string_lossy()), quote(operation)];
+    parts.extend(arguments.iter().map(|argument| quote(argument)));
+    Ok(parts.join(" "))
+}
+
+/// Quote for the exec service's shell and systemd's ExecStart environment expansion. Shell
+/// quoting alone does not protect `$` variables inside the embedded installer script.
+/// Doubling dollars works on older TV systemd versions without --expand-environment=no.
+/// Leave `%` untouched: systemd-run passes ExecStart over D-Bus, not through unit-file parsing.
+fn update_argument(value: &str) -> String {
+    let escaped = value.replace('$', "$$");
+    format!("'{}'", escaped.replace('\'', "'\\''"))
+}
+
+/// Hands a downloaded, verified update to `tv/self-update.sh`, run as root through Homebrew
+/// Channel's exec in its own systemd unit: exec ends its children when the call returns, and the
+/// install closes Luma.
+pub fn start_update(
+    release: &crate::update::Release,
+    attempt: &str,
+    ipk: &std::path::Path,
+) -> Result<(), String> {
+    let directory = install_dir()?;
+    let command = format!(
+        "systemd-run --unit=luma-update-{} --collect /bin/sh -c {} self-update {} {} {} {} {}",
+        attempt,
+        update_argument(include_str!("../tv/self-update.sh")),
+        update_argument(&ipk.to_string_lossy()),
+        update_argument(&release.sha256),
+        update_argument(&release.version),
+        update_argument(&directory.to_string_lossy()),
+        update_argument(attempt),
+    );
+    let envelope = call(
+        "luna://org.webosbrew.hbchannel.service/exec",
+        json!({"command": command}),
+    )?;
+    // systemd-run prints nothing on stdout once the unit started; only its exit status counts.
+    // A transport error can be ambiguous: the worker preserves the IPK and observes the result.
+    for key in ["returnCode", "exitCode"] {
+        if let Some(code) = envelope.get(key)
+            && code != 0
+            && code != "0"
+        {
+            let stderr = envelope.get("stderrString").and_then(Value::as_str);
+            return Err(format!(
+                "The installer could not be started ({key}={code}): {}",
+                output_excerpt(stderr.unwrap_or(""))
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Read only the root-owned result; the caller matches its unguessable attempt ID.
+pub fn update_result_for(
+    attempt: Option<&str>,
+) -> Result<Option<crate::update::InstallResult>, String> {
+    let file = match attempt {
+        Some(id) if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("result.{id}.json")
+        }
+        Some(_) => return Err("Invalid update attempt".into()),
+        None => "result.json".into(),
+    };
+    let envelope = call(
+        "luna://org.webosbrew.hbchannel.service/exec",
+        json!({
+            "command": format!("cat /var/lib/luma-update/{file} 2>/dev/null || true")
+        }),
+    )?;
+    let output = envelope
+        .get("stdoutString")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if output.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_str(output)
+        .map(Some)
+        .map_err(|e| format!("Invalid installer result: {e}"))
+}
+
 fn sync_splash(background: &str) -> Result<(), String> {
     let directory = install_dir()?;
-    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-    let command = format!(
-        "/usr/bin/node -e {} {}",
-        quote(include_str!("../tv/sync-splash.cjs")),
-        quote(&json!({"directory": directory, "background": background}).to_string())
-    );
+    // The executable/manifest Home already runs privileged. Avoid starting another process or
+    // queuing a Homebrew call behind its startup; file work still stays on the platform worker.
+    #[cfg(all(feature = "webos", unix))]
+    if unsafe { libc::geteuid() } == 0 {
+        return luma_tv_helper::files::sync_splash(
+            &luma_tv_helper::system::Tv,
+            &directory,
+            background,
+        )
+        .map(|_| ());
+    }
+    let command = helper_command(
+        "sync-splash",
+        &[json!({"directory":directory,"background":background}).to_string()],
+    )?;
     let envelope = call(
         "luna://org.webosbrew.hbchannel.service/exec",
         json!({"command": command}),
@@ -363,6 +502,7 @@ fn sync_splash(background: &str) -> Result<(), String> {
 /// reliable cross-version removability flag.
 pub fn can_uninstall(id: &str) -> bool {
     valid_app_id(id)
+        && !id.starts_with(crate::model::CUSTOM_TILE_PREFIX)
         && !crate::scroll_preview::is_placeholder(id)
         && !["com.webos.", "com.palm.", "com.lge."]
             .iter()
@@ -476,12 +616,10 @@ pub fn read_app_icons(source: &app_artwork::Source) -> Result<Vec<Vec<u8>>, Stri
     if !cfg!(feature = "webos") {
         return Err("Installed artwork is only read on TV builds".into());
     }
-    let quote = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
-    let command = format!(
-        "/usr/bin/node -e {} {}",
-        quote(include_str!("../tv/read-app-icon.cjs")),
-        quote(&serde_json::to_string(source).map_err(|e| e.to_string())?)
-    );
+    let command = helper_command(
+        "read-app-icon",
+        &[serde_json::to_string(source).map_err(|e| e.to_string())?],
+    )?;
     let envelope = call(
         "luna://org.webosbrew.hbchannel.service/exec",
         json!({"command": command}),
@@ -627,8 +765,7 @@ fn inventory() -> Result<(Inventory, Option<String>), String> {
         "luna://com.webos.applicationManager/listApps",
         "apps",
     )?)?;
-    let inputs = inventory_read("luna://com.webos.service.eim/getAllInputStatus", "devices")
-        .and_then(|raw| normalize_inputs(&raw));
+    let inputs = input_inventory();
     match inputs {
         Ok(inputs) => {
             eprintln!(
@@ -646,6 +783,11 @@ fn inventory() -> Result<(Inventory, Option<String>), String> {
             Some(format!("Inputs could not be refreshed: {error}")),
         )),
     }
+}
+
+fn input_inventory() -> Result<Vec<Input>, String> {
+    inventory_read("luna://com.webos.service.eim/getAllInputStatus", "devices")
+        .and_then(|raw| normalize_inputs(&raw))
 }
 
 fn title(value: Option<&str>, fallback: &str) -> String {
@@ -683,7 +825,7 @@ pub fn normalize_apps(raw: &Value) -> Result<Vec<App>, String> {
             || id == "com.luma.native"
             || id == "com.luma.launcher"
             || id == "com.luma.launcher.native"
-            || id == "com.webos.app.home"
+            || is_home_id(id)
             || id.starts_with("com.webos.app.hdmi")
             || id.starts_with("com.webos.app.externalinput.")
             || (!live && (visible == Some(&json!(false)) || visible == Some(&json!("false"))))
@@ -747,6 +889,7 @@ pub fn normalize_inputs(raw: &Value) -> Result<Vec<Input>, String> {
             id: id.into(),
             title: title(entry.get("label").and_then(Value::as_str), &port),
             port,
+            signal: entry.get("hdmiSignalExist").and_then(Value::as_bool),
             // Some firmware reports `connected: true` for every existing port;
             // `hdmiPlugIn` is the actual cable state where it is provided.
             connected: entry
@@ -756,4 +899,78 @@ pub fn normalize_inputs(raw: &Value) -> Result<Vec<Input>, String> {
         });
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod update_argument_tests {
+    use super::*;
+
+    #[test]
+    fn installer_variables_are_escaped_and_printf_formats_are_preserved() {
+        let script = include_str!("../tv/self-update.sh");
+        let argument = update_argument(script);
+        assert!(argument.contains("$${#ATTEMPT}"));
+        assert!(argument.contains("$$(date +%T)"));
+        assert!(argument.contains("$$IPK"));
+        assert!(argument.contains("%s"));
+        assert!(!argument.contains("%%s"));
+    }
+
+    #[test]
+    fn exec_shell_preserves_systemd_escapes_and_argument_boundaries() {
+        for value in [
+            include_str!("../tv/self-update.sh"),
+            "path with 'quotes' and $VARIABLE ${BRACES} $(command) %n %% \\slashes",
+        ] {
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("printf '%s' {}", update_argument(value))])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let argument = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(argument, value.replace('$', "$$"));
+            // systemd reduces each escaped dollar pair, leaving expansion to /bin/sh.
+            assert_eq!(argument.replace("$$", "$"), value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod home_identity_tests {
+    use super::*;
+    #[test]
+    fn executable_identity_has_priority_over_conflicting_launch_metadata() {
+        assert_eq!(
+            home_identity(
+                Some(std::path::Path::new(LG_HOME_EXE)),
+                Some(&json!({"appId": FULL_HOME_ID}))
+            ),
+            HOME_ID
+        );
+        assert_eq!(
+            home_identity(
+                Some(std::path::Path::new("/usr/bin/com.webos.app.fullhome")),
+                Some(&json!({"nid": HOME_ID}))
+            ),
+            FULL_HOME_ID
+        );
+        assert_eq!(
+            home_identity(None, Some(&json!({"appId": FULL_HOME_ID}))),
+            FULL_HOME_ID
+        );
+        assert_eq!(
+            home_identity(None, Some(&json!({"nid": FULL_HOME_ID}))),
+            FULL_HOME_ID
+        );
+        assert_eq!(
+            home_identity(None, Some(&json!({"nid": "other.app"}))),
+            HOME_ID
+        );
+        assert_eq!(home_identity(None, None), HOME_ID);
+    }
+    #[test]
+    fn both_home_variants_are_hidden_from_application_inventory() {
+        let raw = json!([{"id":HOME_ID,"title":"Home","visible":true}, {"id":FULL_HOME_ID,"title":"Home","visible":true}]);
+        assert!(normalize_apps(&raw).unwrap().is_empty());
+    }
 }

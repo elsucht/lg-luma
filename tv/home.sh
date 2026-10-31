@@ -1,20 +1,28 @@
 #!/bin/sh
 # Optional native Home replacement. The webosbrew hook has no .sh suffix.
 STATE=/var/lib/luma-home
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
+# The cold-boot hook is a symlink to the copied $STATE/home.sh: find luma-helper beside its target.
+SCRIPT=$0
+if [ -L "$SCRIPT" ]; then
+  LINK=$(readlink "$SCRIPT") || exit 1
+  case "$LINK" in /*) SCRIPT=$LINK ;; *) SCRIPT=$(dirname -- "$SCRIPT")/$LINK ;; esac
+fi
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$SCRIPT")" && pwd) || exit 1
 COMMAND=${1:-boot}
 case "$COMMAND" in
   enable|disable|restore|status|apply|boot) ;;
-  *) printf '%s\n' 'Usage: home.sh enable [APP_DIR] | disable | restore | status' >&2; exit 1 ;;
+  *) printf '%s\n' 'Usage: home.sh enable [APP_DIR] [HOME_ID] | disable | restore | status' >&2; exit 1 ;;
 esac
 [ "$(id -u)" = 0 ] || { printf '%s\n' 'Run as root.' >&2; exit 1; }
-[ -x /usr/bin/node ] || { printf '%s\n' 'The TV Node.js runtime is missing.' >&2; exit 1; }
+# boot only schedules the copied $STATE/home.sh apply, which checks for the helper itself.
+[ "$COMMAND" = boot ] || [ -x "$SCRIPT_DIR/luma-helper" ] ||
+  { printf '%s\n' 'The native Luma TV helper is missing.' >&2; exit 1; }
 if [ "$COMMAND" = enable ] && grep -q 'release [56]\.' /etc/starfish-release 2>/dev/null; then
   printf '%s\n' \
     'Enabling Luma Home (webOS 5/6) will:' \
     '  1. Close any running normal Luma instance.' \
     "  2. Create $STATE with integration scripts and saved state." \
-    "  3. Bind-mount Luma's executable over /usr/bin/com.webos.app.home." \
+    "  3. Bind-mount Luma's executable over the selected LG Home executable." \
     "     LG's Home manifest and role stay; Luma registers with SAM itself." \
     '  4. Stop the previous Home process and launch Luma as Home.' \
     '  5. Install /var/lib/webosbrew/init.d/64-luma-home to reapply the mount at cold boot.' \
@@ -39,6 +47,8 @@ elif [ "$COMMAND" = enable ]; then
     ''
 fi
 if [ "$COMMAND" = enable ]; then
+  printf '%s\n' "Selected Home target: ${3:-saved target, otherwise com.webos.app.home}"
+
   while :; do
     printf '%s' 'Apply these changes? [y/n]: '
     if ! IFS= read -r answer; then
@@ -64,4 +74,4 @@ if [ "$COMMAND" = boot ]; then
 fi
 exec 9>"$STATE/lock"
 flock -n 9 || { printf '%s\n' 'Luma Home integration is already being changed.' >&2; exit 1; }
-exec /usr/bin/node "$SCRIPT_DIR/home.cjs" "$COMMAND" "${2:-$SCRIPT_DIR}"
+exec "$SCRIPT_DIR/luma-helper" home "$COMMAND" "${2:-$SCRIPT_DIR}" "${3:-}"
