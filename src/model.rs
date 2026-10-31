@@ -614,7 +614,6 @@ pub fn demo_inventory() -> Inventory {
     inventory
 }
 
-/// Regions whose clocks conventionally show 12 hours.
 /// Regions whose preferred hour cycle is 12-hour (`_preferred` `h`) in CLDR 49 `timeData`, sorted.
 pub(crate) const TWELVE_HOUR_REGIONS: [&str; 99] = [
     "AE", "AG", "AL", "AS", "AU", "BB", "BD", "BH", "BM", "BN", "BO", "BS", "BT", "CA", "CO", "CR",
